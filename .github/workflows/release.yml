@@ -63,15 +63,20 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
+      - name: Copy Python orchestrator into dist
+        run: cp scratch-dna/run-scratch-dna.py dist/run-scratch-dna.py
+
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum scratch-dna-* > checksums.txt
+        run: sha256sum scratch-dna-* run-scratch-dna.py > checksums.txt
 
       - name: Create GitHub Release
         env:
@@ -82,4 +87,5 @@ jobs:
             --title "${{ github.ref_name }}" \
             --generate-notes \
             dist/scratch-dna-* \
+            dist/run-scratch-dna.py \
             dist/checksums.txt
