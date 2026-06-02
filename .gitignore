@@ -11,6 +11,12 @@
 # Test binary, built with `go test -c`
 *.test
 
+# Compiled scratch-dna binaries (built locally / in CI, not committed)
+scratch-dna/scratch-dna-c
+scratch-dna/scratch-dna-go
+scratch-dna/scratch-dna
+__pycache__/
+
 # Code coverage profiles and other test artifacts
 *.out
 coverage.*
@@ -26,6 +32,9 @@ go.work.sum
 
 # env file
 .env
+
+# user's local copy of the test folder list (copied from testfolders.csv.default)
+testfolders.csv
 
 # Editor/IDE
 # .idea/

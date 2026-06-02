@@ -1,0 +1,85 @@
+name: Release
+
+# Build the scratch-dna binaries and attach them to a GitHub Release whenever a
+# version tag (e.g. v1.0.0) is pushed.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} binaries
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install ARM64 cross-compiler
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build scratch-dna-go
+        working-directory: scratch-dna
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
+        run: go build -trimpath -ldflags='-s -w' -o "scratch-dna-go-linux-${{ matrix.arch }}" scratch-dna.go
+
+      - name: Build scratch-dna-c
+        working-directory: scratch-dna
+        run: |
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            CC=aarch64-linux-gnu-gcc
+          else
+            CC=gcc
+          fi
+          "$CC" -O2 -pthread -static -o "scratch-dna-c-linux-${{ matrix.arch }}" scratch-dna.c
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: |
+            scratch-dna/scratch-dna-go-linux-${{ matrix.arch }}
+            scratch-dna/scratch-dna-c-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum scratch-dna-* > checksums.txt
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            dist/scratch-dna-* \
+            dist/checksums.txt
