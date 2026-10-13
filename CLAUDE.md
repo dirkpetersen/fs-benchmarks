@@ -35,8 +35,9 @@ Go-only flags — each has an equivalent short and long form (interchangeable, b
 | `-t` | `--timeout` | timeout in seconds for the whole run (default 600) |
 | `-s` | `--sync` | fsync() after each file write |
 | `-u` | `--unique` | stamp a unique 8-byte tag every 4 KiB so no two blocks repeat |
+| | `--one-dir` | all workers share one directory tree (the old layout) instead of one `w<N>` subtree each |
 
-**C** (behaviorally identical to the Go version — same flags, output, filenames, and worker-pool model):
+**C** (same flags, output, filenames, and worker-pool model as Go, **except** it has no `--one-dir` and always uses the shared layout that Go's `--one-dir` produces — see Directory layout below):
 ```bash
 cd scratch-dna
 gcc -O2 -pthread -o scratch-dna scratch-dna.c
@@ -66,13 +67,29 @@ python3 run-scratch-dna.py -p 4 user@host:/mnt/data 1000 65536 2  # remote targe
 - **Remote**: if the root dir is `[user@]host:/abs/path`, it `scp`s the binaries + this script to `~/bin` on that host and runs there over SSH, capturing the JSON back.
 - Same output contract: aggregated JSON summary on stdout, human text on stderr. Writes an SVG performance bar chart (per-instance throughput) to `<root>/scratch-dna-results.svg` unless `--no-graph`.
 
+## Testing
+
+Run from `scratch-dna/` (CI in `.github/workflows/ci.yml` runs exactly these; details in `scratch-dna/TESTING.md`):
+```bash
+gcc -O2 -pthread -o scratch-dna-c scratch-dna.c      # needed by the Python e2e tests
+go test -v -timeout 120s scratch-dna.go scratch-dna_test.go
+bash test-scratch-dna-c.sh
+python3 -m unittest test_run_scratch_dna -v
+```
+Single tests: `go test -run TestName scratch-dna.go scratch-dna_test.go`, or `python3 -m unittest test_run_scratch_dna.ClassName.test_name`. The Go tests build the binary once in `TestMain` and drive it as a subprocess. Both suites assert the same contract (JSON key set, stdout-only JSON, `--unique`); they differ only in the directory layout they expect (see below).
+
 ## Architecture notes
 
-- **Directory layout** (Go and C, identical): files go under `<target>/<hostname>/<random-parent>/<random-leaf>/`. Using the bare hostname as the top-level subdirectory keeps multiple hosts on a shared filesystem from stepping on each other. To avoid overfilling any one directory, each leaf holds at most `filesPerDir` (10000) files and each parent holds at most `subdirsPerDir` (100) leaves; a new randomly-named directory is started when a limit is reached. All bucket directories are created single-threaded up front (`planBuckets` / `plan_buckets`), so a file index maps to its directory with `bucketFor(idx) = (idx-1)/filesPerDir` and workers never race on `mkdir`. (Python still uses the old flat `<hostname>/` layout.)
+- **Directory layout**: using the bare hostname as the top-level subdirectory keeps multiple hosts on a shared filesystem from stepping on each other. To avoid overfilling any one directory, each leaf holds at most `filesPerDir` (10000) files and each parent holds at most `subdirsPerDir` (100) leaves; a new randomly-named directory is started when a limit is reached.
+  - **Go default — per-worker subtrees**: `<target>/<hostname>/w<N>/<random-parent>/<random-leaf>/`, N = 1..`-p`. The kernel serializes file creates within one directory, so when all workers shared a leaf, adding workers made small-file runs *slower*; giving each worker its own subtree raised small-file rates 2–6× (measured on ext4). Workers still claim indices from the shared counter, so a worker's files are not contiguous indices. Each worker creates its own next leaf lazily via `workerDirs.next()` — no race, since only that worker touches its subtree. The `w<N>` dirs are created up front.
+  - **Go `--one-dir` and C (always) — shared tree**: `<target>/<hostname>/<random-parent>/<random-leaf>/`, with all workers filling the same leaf concurrently. All bucket directories are created single-threaded up front (`planBuckets` / `plan_buckets`), and a file index maps to its directory with `bucketFor(idx) = (idx-1)/filesPerDir`. Use this to measure single-directory create contention, or to compare against results from before the per-worker layout.
+  - Python still uses the old flat `<hostname>/` layout.
 - File naming: `<hostname>-<index>-<multiplier>.txt` — the multiplier value is embedded in the filename so it can be verified after the fact.
-- The Go and C versions both use a **fixed pool of `-p` workers** pulling file indices from a shared queue/counter, so memory stays O(workers) rather than O(files). Each worker has its own RNG to avoid contention, and counts are tracked with atomic counters incremented directly in the workers.
+- The Go and C versions both use a **fixed pool of `-p` workers** pulling file indices from a shared atomic counter, so memory stays O(workers) rather than O(files). Each worker has its own RNG to avoid contention, and counts are tracked with atomic counters incremented directly in the workers.
 - **`-u`/`--unique`**: the DNA buffer is generated once and normally written verbatim to every file, which lets the page cache and filesystem/storage dedup collapse the work and inflate throughput numbers. In unique mode each worker gets a private copy of the buffer and `stamp()` writes an 8-byte tag (derived from file index, block number, and offset) every `stampStride` (4096) bytes before each block write — defeating dedup while touching only a few bytes per block. Expect throughput to drop to the real distinct-data rate.
-- There is no `go.mod` — the Go file is a self-contained single-file program with no external dependencies. Build/vet it with the explicit filename: `go build scratch-dna.go` / `go vet scratch-dna.go`.
+- Go writes files with raw `syscall.Open`/`Write`/`Close` rather than `os.Create`: on Linux an `*os.File` makes a failing netpoller (epoll) registration and a finalizer-backed allocation per file, which costs ~10% at high file rates. This means the Go build no longer compiles on Windows (releases are Linux-only).
+- `scratch-dna/go.mod` exists (module `scratch-dna`, go 1.27.0) but the Go program is a single self-contained file with no external dependencies. Always pass explicit filenames: `go build scratch-dna.go` / `go vet scratch-dna.go`. Do not use `./...` — the directory also holds C sources, which `go` refuses to mix without CGO.
+- Compiled binaries (`scratch-dna`, `scratch-dna-c`, `scratch-dna-go`) are gitignored; `testfolders.csv` is the user's local copy of `testfolders.csv.default` (also gitignored).
 
 ## Releases / CI
 

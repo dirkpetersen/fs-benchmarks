@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -36,6 +37,7 @@ type config struct {
 	timeout  int
 	sync     bool
 	unique   bool
+	oneDir   bool
 }
 
 func main() {
@@ -77,14 +79,32 @@ func main() {
 		hostname = "dna"
 	}
 
-	// Plan the directory layout so no single folder holds too many entries:
-	//   <target>/<hostname>/<random-parent>/<random-sub>/<file>
+	// Plan the directory layout so no single folder holds too many entries.
 	// Each leaf subdirectory holds up to filesPerDir files; each parent holds up
-	// to subdirsPerDir leaf subdirectories. All bucket directories are created
-	// up front (single-threaded) so workers never race to mkdir; a worker maps
-	// its file index to a bucket with bucketFor() and looks up the path.
+	// to subdirsPerDir leaf subdirectories.
+	//
+	// Default: every worker writes into its own subtree
+	//   <target>/<hostname>/w<N>/<random-parent>/<random-sub>/<file>
+	// so concurrent creates never contend on the same directory (the kernel
+	// serializes creates within one directory, which caps small-file rates).
+	//
+	// --one-dir: all workers share one tree
+	//   <target>/<hostname>/<random-parent>/<random-sub>/<file>
+	// and fill the same leaf concurrently. All bucket directories are created
+	// up front (single-threaded); a worker maps its file index to a bucket with
+	// bucketFor() and looks up the path.
 	outDir := filepath.Join(dFlag, hostname)
-	bucketDirs := planBuckets(outDir, nFlag)
+	var bucketDirs []string
+	if cfg.oneDir {
+		bucketDirs = planBuckets(outDir, nFlag)
+	} else {
+		for w := 1; w <= cfg.parallel; w++ {
+			dir := filepath.Join(outDir, "w"+strconv.Itoa(w))
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				log.Fatalf("Failed to create directory %s: %v", dir, err)
+			}
+		}
+	}
 
 	// Context with timeout to prevent hanging.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.timeout)*time.Second)
@@ -97,10 +117,11 @@ func main() {
 	var nfiles, nbytes, errCount atomic.Int64
 	start := time.Now()
 
-	// Fixed worker pool: launch exactly cfg.parallel workers that consume file
-	// indices from a job channel. This bounds goroutine count regardless of how
-	// many files are requested (the old version spawned one goroutine per file).
-	jobs := make(chan int, cfg.parallel*2)
+	// Fixed worker pool: launch exactly cfg.parallel workers that claim file
+	// indices from a shared atomic counter. This bounds goroutine count
+	// regardless of how many files are requested, and is cheaper per file than
+	// handing indices out over a channel.
+	var next atomic.Int64
 	var wg sync.WaitGroup
 	for w := 0; w < cfg.parallel; w++ {
 		wg.Add(1)
@@ -112,13 +133,24 @@ func main() {
 		if cfg.unique {
 			buf = append([]byte(nil), out...)
 		}
-		go func(rng *rand.Rand, buf []byte) {
+		dirs := &workerDirs{base: filepath.Join(outDir, "w"+strconv.Itoa(w+1))}
+		go func(rng *rand.Rand, buf []byte, dirs *workerDirs) {
 			defer wg.Done()
-			for idx := range jobs {
-				if ctx.Err() != nil {
+			for {
+				idx := int(next.Add(1))
+				if idx > nFlag || ctx.Err() != nil {
 					return
 				}
-				wrote, err := writeFile(rng, idx, buf, bucketDirs[bucketFor(idx)], hostname, mFlag, cfg.sync, cfg.unique)
+				var dir string
+				var err error
+				if cfg.oneDir {
+					dir = bucketDirs[bucketFor(idx)]
+				} else if dir, err = dirs.next(); err != nil {
+					log.Printf("Error: %v", err)
+					errCount.Add(1)
+					continue
+				}
+				wrote, err := writeFile(rng, idx, buf, dir, hostname, mFlag, cfg.sync, cfg.unique)
 				if err != nil {
 					log.Printf("Error: %v", err)
 					errCount.Add(1)
@@ -127,20 +159,8 @@ func main() {
 				nfiles.Add(1)
 				nbytes.Add(wrote)
 			}
-		}(rand.New(seed), buf)
+		}(rand.New(seed), buf, dirs)
 	}
-
-	// Feed jobs; stop early if the context is cancelled (timeout).
-	go func() {
-		defer close(jobs)
-		for x := 1; x <= nFlag; x++ {
-			select {
-			case jobs <- x:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
 
 	// Signal completion when all workers have drained the job channel.
 	doneCh := make(chan struct{})
@@ -202,6 +222,8 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.unique, "u", false, "make each block unique to defeat dedup/cache (short for --unique)")
 	flag.BoolVar(&cfg.unique, "unique", false, "make each block unique to defeat dedup/cache")
 
+	flag.BoolVar(&cfg.oneDir, "one-dir", false, "all workers share one directory tree instead of one w<N> subtree each")
+
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Error! 4 positional arguments required.\n")
 		fmt.Fprintf(os.Stderr, "\nUsage: %s [options] <number-of-files> <file-size-bytes> <random-file-size-multiplier> <writable-directory>\n", os.Args[0])
@@ -211,6 +233,7 @@ func parseFlags() config {
 		fmt.Fprintf(os.Stderr, "  -t, --timeout <sec>  timeout for the whole operation (default 600)\n")
 		fmt.Fprintf(os.Stderr, "  -s, --sync           fsync() after each file write\n")
 		fmt.Fprintf(os.Stderr, "  -u, --unique         stamp a unique tag every 4 KiB so no two blocks repeat\n")
+		fmt.Fprintf(os.Stderr, "      --one-dir        all workers write into one shared directory instead of w<N> each\n")
 		fmt.Fprintf(os.Stderr, "\nExample: %s -v -p 8 1024 10485760 1 /tmp\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "         %s --verbose --parallel 8 1024 10485760 1 /tmp\n\n", os.Args[0])
 	}
@@ -287,6 +310,39 @@ func planBuckets(base string, nFiles int) []string {
 	return dirs
 }
 
+// workerDirs hands out leaf directories in one worker's private subtree,
+// base/<random-parent>/<random-sub>, starting a new leaf every filesPerDir
+// files and a new parent every subdirsPerDir leaves. Only its own worker uses
+// it, so directories are created lazily without racing anyone.
+type workerDirs struct {
+	base   string
+	parent string
+	leaf   string
+	files  int // files placed in the current leaf
+	leaves int // leaves created under the current parent
+}
+
+// next returns the directory for the worker's next file.
+func (d *workerDirs) next() (string, error) {
+	if d.leaf == "" || d.files == filesPerDir {
+		if d.parent == "" || d.leaves == subdirsPerDir {
+			parent := filepath.Join(d.base, randName())
+			if err := os.Mkdir(parent, 0o755); err != nil {
+				return "", fmt.Errorf("mkdir %s: %w", parent, err)
+			}
+			d.parent, d.leaves = parent, 0
+		}
+		leaf := filepath.Join(d.parent, randName())
+		if err := os.Mkdir(leaf, 0o755); err != nil {
+			return "", fmt.Errorf("mkdir %s: %w", leaf, err)
+		}
+		d.leaf, d.files = leaf, 0
+		d.leaves++
+	}
+	d.files++
+	return d.leaf, nil
+}
+
 // randName returns a random 16-hex-character directory name.
 func randName() string {
 	const hex = "0123456789abcdef"
@@ -315,15 +371,18 @@ func stamp(buf []byte, fileIdx, block int) {
 }
 
 // writeFile writes the DNA buffer a random number of times (1..mFlag) to a new
-// file. It writes the buffer directly to the *os.File without an intermediate
-// bufio buffer, since each write is already a large block. When unique is set,
+// file. It writes the buffer directly to the file descriptor without an
+// intermediate buffer, since each write is already a large block. When unique is set,
 // buf is the worker's private copy and is stamped in place before each write so
 // no two blocks across the run are identical (see stamp).
 func writeFile(rng *rand.Rand, count int, buf []byte, dir, hostname string, mFlag int, doSync, unique bool) (int64, error) {
 	multiple := rng.IntN(mFlag) + 1
 	filename := filepath.Join(dir, hostname+"-"+strconv.Itoa(count)+"-"+strconv.Itoa(multiple)+".txt")
 
-	f, err := os.Create(filename)
+	// Raw syscalls rather than os.Create: on Linux, os.File tries (and fails)
+	// to register every regular file with the netpoller and allocates a
+	// finalizer-backed object, which is measurable at high file rates.
+	fd, err := syscall.Open(filename, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_TRUNC|syscall.O_CLOEXEC, 0o644)
 	if err != nil {
 		return 0, fmt.Errorf("create %s: %w", filename, err)
 	}
@@ -333,22 +392,28 @@ func writeFile(rng *rand.Rand, count int, buf []byte, dir, hostname string, mFla
 		if unique {
 			stamp(buf, count, j)
 		}
-		n, err := f.Write(buf)
-		written += int64(n)
-		if err != nil {
-			f.Close()
-			return written, fmt.Errorf("write %s (iteration %d/%d): %w", filename, j+1, multiple, err)
+		for off := 0; off < len(buf); {
+			n, err := syscall.Write(fd, buf[off:])
+			if err == syscall.EINTR {
+				continue
+			}
+			if err != nil {
+				syscall.Close(fd)
+				return written, fmt.Errorf("write %s (iteration %d/%d): %w", filename, j+1, multiple, err)
+			}
+			off += n
+			written += int64(n)
 		}
 	}
 
 	if doSync {
-		if err := f.Sync(); err != nil {
-			f.Close()
+		if err := syscall.Fsync(fd); err != nil {
+			syscall.Close(fd)
 			return written, fmt.Errorf("sync %s: %w", filename, err)
 		}
 	}
 
-	if err := f.Close(); err != nil {
+	if err := syscall.Close(fd); err != nil {
 		return written, fmt.Errorf("close %s: %w", filename, err)
 	}
 	return written, nil

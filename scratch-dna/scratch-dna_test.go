@@ -7,7 +7,7 @@ package main
 // it as a subprocess, asserting on the stdout JSON, stderr separation, the
 // on-disk file layout, and the --unique behavior.
 //
-// Run with:  go test ./...   (from the scratch-dna directory)
+// Run with:  go test -v scratch-dna.go scratch-dna_test.go   (from the scratch-dna directory)
 
 import (
 	"bytes"
@@ -165,42 +165,80 @@ func TestStdoutIsOnlyJSON(t *testing.T) {
 }
 
 func TestDirectoryLayout(t *testing.T) {
+	// Default: <dir>/<hostname>/w<N>/<parent>/<leaf>/<file>, one w<N> per worker.
 	dir := t.TempDir()
-	const n = 5
-	stdout, stderr, code := run(t, strconv.Itoa(n), "512", "3", dir)
+	const n, p = 40, 3
+	_, stderr, code := run(t, "-p", strconv.Itoa(p), strconv.Itoa(n), "512", "3", dir)
 	if code != 0 {
 		t.Fatalf("exit %d\nstderr:\n%s", code, stderr)
 	}
-	_ = stdout
+	checkLayout(t, dir, n, true)
 
+	hostname, _ := os.Hostname()
+	entries, err := os.ReadDir(filepath.Join(dir, hostname))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range entries {
+		got = append(got, e.Name())
+	}
+	if strings.Join(got, ",") != "w1,w2,w3" {
+		t.Errorf("worker dirs = %v, want [w1 w2 w3]", got)
+	}
+}
+
+func TestOneDirLayout(t *testing.T) {
+	// --one-dir: <dir>/<hostname>/<parent>/<leaf>/<file>, shared by all workers.
+	dir := t.TempDir()
+	const n = 40
+	_, stderr, code := run(t, "--one-dir", "-p", "3", strconv.Itoa(n), "512", "3", dir)
+	if code != 0 {
+		t.Fatalf("exit %d\nstderr:\n%s", code, stderr)
+	}
+	checkLayout(t, dir, n, false)
+}
+
+// checkLayout asserts every file sits at <dir>/<hostname>/[w<N>/]<parent>/<leaf>/
+// <hostname>-<index>-<mult>.txt, with 16-hex-char parent and leaf names.
+func checkLayout(t *testing.T, dir string, n int, perWorker bool) {
+	t.Helper()
 	hostname, _ := os.Hostname()
 
 	files := countTxtFiles(t, dir)
 	if len(files) != n {
 		t.Fatalf("found %d files, want %d", len(files), n)
 	}
+	depth := 4
+	if perWorker {
+		depth = 5
+	}
 	for _, f := range files {
-		// Layout: <dir>/<hostname>/<parent>/<leaf>/<file>
 		rel, err := filepath.Rel(dir, f)
 		if err != nil {
 			t.Fatal(err)
 		}
 		parts := strings.Split(rel, string(os.PathSeparator))
-		if len(parts) != 4 {
+		if len(parts) != depth {
 			t.Errorf("unexpected path depth for %q: %v", rel, parts)
 			continue
 		}
 		if parts[0] != hostname {
 			t.Errorf("first path component = %q, want hostname %q", parts[0], hostname)
 		}
+		if perWorker {
+			if w, err := strconv.Atoi(strings.TrimPrefix(parts[1], "w")); err != nil || !strings.HasPrefix(parts[1], "w") || w < 1 {
+				t.Errorf("worker dir component %q is not w<N>", parts[1])
+			}
+		}
 		// parent and leaf should be 16-hex-char names.
-		for _, comp := range parts[1:3] {
+		for _, comp := range parts[depth-3 : depth-1] {
 			if len(comp) != 16 || !isHex(comp) {
 				t.Errorf("dir component %q is not 16 hex chars", comp)
 			}
 		}
 		// Filename: <hostname>-<index>-<multiplier>.txt
-		base := parts[3]
+		base := parts[depth-1]
 		if !strings.HasPrefix(base, hostname+"-") || !strings.HasSuffix(base, ".txt") {
 			t.Errorf("filename %q does not match <hostname>-<index>-<mult>.txt", base)
 		}

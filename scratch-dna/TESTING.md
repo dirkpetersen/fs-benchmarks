@@ -4,7 +4,7 @@ All test suites live in `scratch-dna/`. Run them from that directory.
 
 ## Go (`scratch-dna_test.go`)
 
-Requires Go 1.22+. The test builds the binary once via `TestMain` and exercises it as a subprocess.
+Requires Go 1.27+. The test builds the binary once via `TestMain` and exercises it as a subprocess.
 
 ```bash
 go test -v -timeout 120s scratch-dna.go scratch-dna_test.go
@@ -40,7 +40,8 @@ python3 -m pytest test_run_scratch_dna.py -v
 | human chatter on stderr | ✓ | ✓ | - |
 | exact JSON key set | ✓ | ✓ | ✓ (e2e) |
 | file count accuracy (on-disk == JSON) | ✓ | ✓ | ✓ (e2e) |
-| directory layout `host/parent/leaf/` | ✓ | ✓ | - |
+| directory layout `host/w<N>/parent/leaf/` (Go default) | ✓ | - | - |
+| directory layout `host/parent/leaf/` (Go `--one-dir`, C) | ✓ | ✓ | - |
 | `--unique` all files distinct | ✓ | ✓ | - |
 | without `--unique` same-size files identical | ✓ | ✓ | - |
 | long flags work (`--parallel`, `--unique`) | ✓ | ✓ | - |
