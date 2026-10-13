@@ -19,11 +19,11 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
-          go-version: 'stable'
+          go-version-file: scratch-dna/go.mod
 
       - name: Install ARM64 cross-compiler
         if: matrix.arch == 'arm64'
@@ -50,7 +50,7 @@ jobs:
           "$CC" -O2 -pthread -static -o "scratch-dna-c-linux-${{ matrix.arch }}" scratch-dna.c
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.arch }}
           path: |
@@ -63,10 +63,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

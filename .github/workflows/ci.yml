@@ -11,11 +11,11 @@ jobs:
     name: Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
-          go-version: 'stable'
+          go-version-file: scratch-dna/go.mod
 
       - name: Build C binary
         working-directory: scratch-dna
